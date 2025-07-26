@@ -3,7 +3,8 @@ name: Terraform CI for Home Server
 on:
   push:
     branches:
-      - master
+      - gateway-rollback
+
 
 jobs:
   terraform:
