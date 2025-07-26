@@ -1,5 +1,4 @@
-name: CI/CD Pipeline for home server
-description: This workflow deploys the latest changes to the home server when code is pushed to the main branch.
+name: Terraform CI for Home Server
 
 on:
   push:
@@ -7,10 +6,27 @@ on:
       - main
 
 jobs:
-  deploy:
-    name: push to Remote Server
+  terraform:
+    name: Terraform Plan and Lint
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5  # Use your required version
+
+      - name: Initialize Terraform
+        run: terraform init
+
+      - name: Format Check
+        run: terraform fmt -check
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -out=tfplan
