@@ -1,4 +1,5 @@
-name: Deploy via SSH
+name: CI/CD Pipeline for home server
+description: This workflow deploys the latest changes to the home server when code is pushed to the main branch.
 
 on:
   push:
