@@ -7,7 +7,7 @@ on:
 
 jobs:
   deploy:
-    name: Deploy to Remote Server
+    name: push to Remote Server
     runs-on: ubuntu-latest
 
     steps:
