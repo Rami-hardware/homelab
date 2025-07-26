@@ -1,0 +1,209 @@
+---
+- name: Deploy All Docker Services with Docker Installation (need to sort LoL not final )
+  hosts: gateway
+  become: true
+
+  vars:
+    docker_compose_dir: /opt/services
+    docker_compose_file: "{{ docker_compose_dir }}/docker-compose.yml"
+
+    promtail_config: |
+      server:
+        http_listen_port: 9080
+        grpc_listen_port: 0
+      positions:
+        filename: /tmp/positions.yaml
+      clients:
+        - url: http://localhost:3100/loki/api/v1/push
+      scrape_configs:
+        - job_name: system
+          static_configs:
+            - targets:
+                - localhost
+              labels:
+                job: varlogs
+                __path__: /var/log/*.log
+
+    grafana_agent_config: |
+      server:
+        http_listen_port: 12345
+      metrics:
+        wal_directory: /tmp/wal
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        configs:
+          - name: integrations
+            scrape_configs:
+              - job_name: node_exporter
+                static_configs:
+                  - targets: ['host.docker.internal:9100']
+
+  tasks:
+  - name: Install required packages for Docker repo setup
+    apt:
+      name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      state: present
+      update_cache: yes
+
+  - name: Add Docker GPG key
+    get_url:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      dest: /etc/apt/keyrings/docker.asc
+      mode: '0644'
+
+  - name: Add Docker repository
+    apt_repository:
+      repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+      state: present
+      filename: docker
+
+  - name: Install Docker and Docker Compose plugin
+    apt:
+      name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      state: present
+      update_cache: yes
+
+  - name: Ensure Docker is started and enabled
+    service:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Create service directory
+    file:
+      path: "{{ docker_compose_dir }}"
+      state: directory
+      mode: '0755'
+
+  - name: Create fail2ban config directory
+    file:
+      path: "{{ docker_compose_dir }}/fail2ban"
+      state: directory
+      mode: '0755'
+
+  - name: Write Promtail config
+    copy:
+      content: "{{ promtail_config }}"
+      dest: "{{ docker_compose_dir }}/promtail-config.yml"
+
+  - name: Write Grafana Agent config
+    copy:
+      content: "{{ grafana_agent_config }}"
+      dest: "{{ docker_compose_dir }}/grafana-agent-config.yaml"
+
+  - name: Write Docker Compose configuration
+    copy:
+      dest: "{{ docker_compose_file }}"
+      content: |
+        version: '3.8'
+
+        services:
+          adguardhome:
+            image: adguard/adguardhome
+            container_name: adguardhome
+            ports:
+              - "3000:3000"
+              - "53:53/udp"
+              - "8081:80"
+            volumes:
+              - adguard_config:/opt/adguardhome/conf
+              - adguard_work:/opt/adguardhome/work
+            restart: unless-stopped
+
+          promtail:
+            image: grafana/promtail:latest
+            container_name: promtail
+            volumes:
+              - /var/log:/var/log
+              - "{{ docker_compose_dir }}/promtail-config.yml:/etc/promtail/config.yml"
+            command: -config.file=/etc/promtail/config.yml
+            restart: unless-stopped
+
+          grafana-agent:
+            image: grafana/agent:latest
+            container_name: grafana-agent
+            volumes:
+              - "{{ docker_compose_dir }}/grafana-agent-config.yaml:/etc/agent-config.yaml"
+            command: --config.file=/etc/agent-config.yaml
+            ports:
+              - "12345:12345"
+            restart: unless-stopped
+
+          watchtower:
+            image: containrrr/watchtower
+            container_name: watchtower
+            volumes:
+              - /var/run/docker.sock:/var/run/docker.sock
+            command: --cleanup --interval 3600
+            restart: unless-stopped
+
+          nginx:
+            image: nginx:latest
+            container_name: nginx
+            ports:
+              - "80:80"
+            volumes:
+              - /opt/services/default.conf:/etc/nginx/conf.d/default.conf:ro
+            restart: unless-stopped
+
+          fail2ban:
+            image: crazymax/fail2ban
+            container_name: fail2ban
+            network_mode: host
+            volumes:
+              - /var/log:/var/log:ro
+              - "{{ docker_compose_dir }}/fail2ban:/data"
+            restart: unless-stopped
+
+          portainer:
+            image: portainer/portainer-ce:latest
+            container_name: portainer
+            ports:
+              - "9000:9000"
+            volumes:
+              - /var/run/docker.sock:/var/run/docker.sock
+              - portainer_data:/data
+            restart: unless-stopped
+
+          uptime-kuma:
+            image: louislam/uptime-kuma:latest
+            container_name: uptime-kuma
+            ports:
+              - "3001:3001"
+            volumes:
+              - uptime_kuma_data:/app/data
+            restart: unless-stopped
+
+        volumes:
+          adguard_config:
+          adguard_work:
+          portainer_data:
+          uptime_kuma_data:
+
+  - name: Pull Docker images
+    command: docker compose pull
+    args:
+      chdir: "{{ docker_compose_dir }}"
+
+  - name: Start Docker containers
+    command: docker compose up -d
+    args:
+      chdir: "{{ docker_compose_dir }}"
+
+  - name: Show running containers
+    shell: docker ps --format '{{"{{.Names}}"}} - {{"{{.Status}}"}}'
+    register: running_containers
+
+  - name: Output container status
+    debug:
+      var: running_containers.stdout_lines
