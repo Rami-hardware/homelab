@@ -3,7 +3,7 @@ name: Terraform CI for Home Server
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   terraform:
