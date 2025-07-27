@@ -40,6 +40,37 @@
                   - targets: ['host.docker.internal:9100']
 
   tasks:
+
+  - name: Ensure DNS is set via systemd-resolved
+    become: true
+    block:
+    - name: Configure systemd-resolved DNS
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?DNS='
+        line: 'DNS=1.1.1.1 8.8.8.8'
+        backup: yes
+
+    - name: Ensure DNSStubListener is enabled (optional)
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?DNSStubListener='
+        line: 'DNSStubListener=yes'
+        backup: yes
+
+    - name: Restart systemd-resolved
+      systemd:
+        name: systemd-resolved
+        state: restarted
+        enabled: true
+
+    - name: Recreate /etc/resolv.conf symlink (if broken or missing)
+      file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: yes
+
   - name: Install required packages for Docker repo setup
     apt:
       name:
@@ -49,6 +80,12 @@
       - lsb-release
       state: present
       update_cache: yes
+
+  - name: Create /etc/apt/keyrings directory
+    file:
+      path: /etc/apt/keyrings
+      state: directory
+      mode: '0755'
 
   - name: Add Docker GPG key
     get_url:
@@ -100,6 +137,24 @@
     copy:
       content: "{{ grafana_agent_config }}"
       dest: "{{ docker_compose_dir }}/grafana-agent-config.yaml"
+
+  - name: Remove wrongly created directory if exists
+    file:
+      path: /opt/services/default.conf
+      state: absent
+
+  - name: Create empty nginx default.conf file
+    copy:
+      dest: /opt/services/default.conf
+      content: ""
+      mode: '0644'
+
+  - name: Ensure default.conf exists for nginx
+    copy:
+      dest: /opt/services/default.conf
+      content: ""
+      force: no
+      mode: '0644'
 
   - name: Write Docker Compose configuration
     copy:

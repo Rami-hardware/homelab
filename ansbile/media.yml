@@ -1,0 +1,261 @@
+---
+- name: Deploy Media Docker Services with RAID and SSD Separation and NVIDIA GPU support
+  hosts: media
+  become: true
+
+  vars:
+    docker_compose_dir: /opt/services
+    docker_compose_file: "{{ docker_compose_dir }}/docker-compose.yml"
+    docker_daemon_json: /etc/docker/daemon.json
+    nvidia_repo_url: "https://nvidia.github.io/nvidia-docker/{{ ansible_distribution | lower }}{{ ansible_distribution_version.split('.')[0] }}/{{ ansible_architecture }}/nvidia-docker.list"
+
+  tasks:
+
+  - name: Create RAID 0 and mount to /mnt/media
+    block:
+    - name: Create RAID 0 with /dev/sdb and /dev/sdc
+      command: mdadm --create --verbose /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
+      args:
+        creates: /dev/md0
+
+    - name: Wait for RAID device
+      wait_for:
+        path: /dev/md0
+        timeout: 30
+
+    - name: Format RAID volume
+      filesystem:
+        fstype: ext4
+        dev: /dev/md0
+
+    - name: Create mount point
+      file:
+        path: /mnt/media
+        state: directory
+
+    - name: Mount RAID
+      mount:
+        path: /mnt/media
+        src: /dev/md0
+        fstype: ext4
+        opts: defaults
+        state: mounted
+
+    - name: Get UUID of /dev/md0
+      command: blkid -s UUID -o value /dev/md0
+      register: md0_uuid
+
+    - name: Add RAID to fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "UUID={{ md0_uuid.stdout }} /mnt/media ext4 defaults 0 0"
+        create: yes
+
+  - name: Create media directories
+    file:
+      path: "/mnt/media/{{ item }}"
+      state: directory
+    loop:
+    - movies
+    - tv
+    - download
+    - radarr
+    - sonarr
+    - bazarr
+    - qbittorrent
+
+  - name: Create SSD-based config directories
+    file:
+      path: "/opt/{{ item }}"
+      state: directory
+    loop:
+    - overseerr
+    - plex
+    - jellyfin
+    - sonarr
+    - radarr
+    - bazarr
+    - qbittorrent
+    - prowlarr
+
+  - name: Add NVIDIA Docker GPG key
+    apt_key:
+      url: https://nvidia.github.io/nvidia-docker/gpgkey
+      state: present
+
+  - name: Add NVIDIA Docker repository
+    shell: |
+      distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+      curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-docker.gpg
+      curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-docker.gpg] https://#' | \
+        tee /etc/apt/sources.list.d/nvidia-docker.list
+    args:
+      executable: /bin/bash
+
+  - name: Update apt cache
+    apt:
+      update_cache: yes
+
+  - name: Install NVIDIA Container Toolkit
+    apt:
+      name: nvidia-container-toolkit
+      state: present
+
+  - name: Configure Docker to use NVIDIA runtime
+    copy:
+      dest: "{{ docker_daemon_json }}"
+      content: |
+        {
+          "runtimes": {
+            "nvidia": {
+              "path": "nvidia-container-runtime",
+              "runtimeArgs": []
+            }
+          }
+        }
+      mode: '0644'
+    notify: Restart Docker
+
+  - name: Write Docker Compose file with Jellyfin GPU support
+    copy:
+      dest: "{{ docker_compose_file }}"
+      content: |
+        services:
+
+          plex:
+            image: plexinc/pms-docker:latest
+            container_name: plex
+            network_mode: host
+            environment:
+              - TZ=Europe/London
+            volumes:
+              - /opt/plex:/config
+              - /mnt/media:/data
+            restart: unless-stopped
+
+          jellyfin:
+            image: jellyfin/jellyfin:latest
+            container_name: jellyfin
+            ports:
+              - "8096:8096"
+              - "8920:8920"
+            environment:
+              - TZ=Europe/London
+              - NVIDIA_VISIBLE_DEVICES=all
+            deploy:
+              resources:
+                reservations:
+                  devices:
+                    - capabilities: [gpu]
+            volumes:
+              - /opt/jellyfin:/config
+              - /mnt/media:/media
+            restart: unless-stopped
+
+          overseerr:
+            image: sctx/overseerr:latest
+            container_name: overseerr
+            ports:
+              - "5055:5055"
+            environment:
+              - TZ=Europe/London
+            volumes:
+              - /opt/overseerr:/app/config
+            restart: unless-stopped
+
+          radarr:
+            image: linuxserver/radarr
+            container_name: radarr
+            ports:
+              - "7878:7878"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/radarr:/config
+              - /mnt/media/movies:/movies
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          sonarr:
+            image: linuxserver/sonarr
+            container_name: sonarr
+            ports:
+              - "8989:8989"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/sonarr:/config
+              - /mnt/media/tv:/tv
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          bazarr:
+            image: linuxserver/bazarr
+            container_name: bazarr
+            ports:
+              - "6767:6767"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/bazarr:/config
+              - /mnt/media/tv:/tv
+              - /mnt/media/movies:/movies
+            restart: unless-stopped
+
+          qbittorrent:
+            image: linuxserver/qbittorrent
+            container_name: qbittorrent
+            ports:
+              - "8080:8080"
+              - "6881:6881"
+              - "6881:6881/udp"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+              - WEBUI_PORT=8080
+            volumes:
+              - /opt/qbittorrent:/config
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          prowlarr:
+            image: lscr.io/linuxserver/prowlarr:latest
+            container_name: prowlarr
+            ports:
+              - "9696:9696"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/prowlarr:/config
+            restart: unless-stopped
+
+  - name: Start Docker Compose
+    command: docker compose -f {{ docker_compose_file }} up -d --remove-orphans
+    args:
+      chdir: "{{ docker_compose_dir }}"
+
+  - name: Check NVIDIA GPU status with nvidia-smi
+    command: nvidia-smi
+    register: nvidia_output
+    ignore_errors: true
+
+  - name: Display nvidia-smi output
+    debug:
+      var: nvidia_output.stdout
+
+  handlers:
+  - name: Restart Docker
+    systemd:
+      name: docker
+      state: restarted
+      daemon_reload: yes
