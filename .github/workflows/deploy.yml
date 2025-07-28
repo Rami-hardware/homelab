@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - media-rollback
-      - master
 
 
 jobs:
