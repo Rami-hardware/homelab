@@ -86,10 +86,9 @@
       line: "UUID={{ md0_uuid.stdout }} /mnt/media ext4 defaults 0 0"
       create: yes
 
-  - name: Save mdadm config
+  - name: Save mdadm config (ignore errors)
     shell: mdadm --detail --scan > /etc/mdadm/mdadm.conf
-    notify:
-    - Update initramfs
+    ignore_errors: yes
 
   - name: Create /etc/apt/keyrings directory
     file:
@@ -124,6 +123,35 @@
       - docker-buildx-plugin
       - docker-compose-plugin
       state: present
+
+  - name: Backup current cloud-init netplan file
+    copy:
+      src: /etc/netplan/50-cloud-init.yaml
+      dest: /etc/netplan/50-cloud-init.yaml.bak
+      remote_src: yes
+    ignore_errors: yes
+
+  - name: Configure static network via netplan
+    copy:
+      dest: /etc/netplan/01-netcfg.yaml
+      content: |
+        network:
+          version: 2
+          ethernets:
+            ens18:
+              addresses:
+                - 192.168.1.201/24
+              gateway4: 192.168.1.1
+              nameservers:
+                addresses: [8.8.8.8,8.8.4.4]
+
+  - name: Apply netplan config
+    command: netplan apply
+
+  - name: Disable cloud-init networking
+    file:
+      path: /etc/cloud/cloud-init.disabled
+      state: touch
 
   # NVIDIA Container Toolkit installation steps
   - name: Add NVIDIA Docker GPG key
@@ -219,6 +247,14 @@
             volumes:
               - /opt/plex:/config
               - /mnt/media:/data
+            ports:
+              - "32400:32400/tcp"
+              - "1900:1900/udp"
+              - "32410:32410/udp"
+              - "32412:32412/udp"
+              - "32413:32413/udp"
+              - "32414:32414/udp"
+              - "5353:5353/udp"
             restart: unless-stopped
 
           jellyfin:
@@ -350,10 +386,82 @@
               - CAPTCHA_SOLVER=none
             restart: unless-stopped
 
+  - name: Check if NVIDIA driver is loaded
+    command: nvidia-smi
+    register: nvidia_check
+    ignore_errors: yes
+
+  - name: Set GPU availability fact
+    set_fact:
+      gpu_available: "{{ nvidia_check.rc == 0 }}"
+
+  - name: Debug GPU availability
+    debug:
+      msg: "Is GPU available? {{ gpu_available }}"
+
+  - name: Remove GPU-dependent container if GPU not available
+    shell: docker rm -f jellyfin
+    when: not gpu_available
+    ignore_errors: yes
+
+  - name: Pull Docker images
+    command: docker compose pull
+    args:
+      chdir: "{{ docker_compose_dir }}"
+
+  - name: Remove existing jellyfin container (if exists)
+    shell: docker rm -f jellyfin
+    ignore_errors: yes
+
   - name: Start Docker Compose stack
     command: docker compose -f "{{ docker_compose_file }}" up -d --remove-orphans
     args:
       chdir: "{{ docker_compose_dir }}"
+
+- name: Configure UFW for media services and allow SSH
+  hosts: all
+  become: true
+  tasks:
+  - name: Ensure UFW is installed
+    apt:
+      name: ufw
+      state: present
+      update_cache: yes
+
+  - name: Allow SSH
+    ufw:
+      rule: allow
+      name: OpenSSH
+
+  - name: Allow media service ports
+    ufw:
+      rule: allow
+      port: "{{ item }}"
+      proto: tcp
+    loop:
+    - 8096 # jellyfin
+    - 8920 # jellyfin (HTTPS)
+    - 5055 # overseerr
+    - 7878 # radarr
+    - 8989 # sonarr
+    - 6767 # bazarr
+    - 8080 # qbittorrent web UI
+    - 6881 # qbittorrent TCP
+    - 9696 # prowlarr
+    - 9001 # portainer_agent
+    - 8191 # flaresolverr
+    - 32400 # plex web & DLNA
+
+  - name: Allow qbittorrent UDP port (6881)
+    ufw:
+      rule: allow
+      port: 6881
+      proto: udp
+
+  - name: Enable UFW (if not already)
+    ufw:
+      state: enabled
+      policy: deny
 
   handlers:
   - name: Restart Docker

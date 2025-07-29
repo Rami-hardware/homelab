@@ -11,7 +11,7 @@ resource "proxmox_vm_qemu" "gateway" {
 
   ciuser     = var.ciUser
   cipassword = var.ciPassword
-  ipconfig0  = "ip=192.168.1.200/24,gw=192.168.1.250"
+  ipconfig0  = "ip=192.168.1.200/24,gw=192.168.1.1"
   
   # Add VirtIO SCSI controller
   scsihw = "virtio-scsi-pci"
@@ -65,7 +65,7 @@ resource "proxmox_vm_qemu" "media" {
 
   ciuser     = "media"
   cipassword = "media123"
-  ipconfig0  = "ip=192.168.1.201/24,gw=192.168.1.250"
+  ipconfig0  = "ip=192.168.1.201/24,gw=192.168.1.1"
   
   scsihw = "virtio-scsi-pci"
 
@@ -115,6 +115,8 @@ resource "proxmox_vm_qemu" "media" {
     id   = 0
     type = "socket"
   }
+
+
 
   lifecycle {
     ignore_changes = [disk[0].size]

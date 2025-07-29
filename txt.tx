@@ -1,20 +1,4 @@
 server {
-    listen 443 ssl;
-    server_name respawnxd.co www.respawnxd.co;
-
-    ssl_certificate /path/to/fullchain.pem;
-    ssl_certificate_key /path/to/privkey.pem;
-
-    location / {
-        proxy_pass http://192.168.1.200;  # Your actual web server IP
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-
-server {
     listen 80;
     server_name uptime.respawnxd.co;
 
@@ -106,20 +90,6 @@ server {
 }
 
 
-
-
-server {
-    listen 80;
-    server_name tautulli.respawnxd.co;
-
-    location / {
-        proxy_pass http://192.168.1.201:8181;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
 
 sudo rm /etc/apt/sources.list.d/nvidia-docker.list
 sudo rm -rf /etc/apt/keyrings/nvidia-docker.gpg

@@ -1,85 +1,94 @@
 ---
-- name: Deploy All Docker Services with Docker Installation (need to sort LoL not final )
-  hosts: gateway
+- name: Deploy Media Docker Services with RAID, SSD Separation, and NVIDIA GPU support
+  hosts: media
   become: true
 
   vars:
     docker_compose_dir: /opt/services
     docker_compose_file: "{{ docker_compose_dir }}/docker-compose.yml"
-
-    promtail_config: |
-      server:
-        http_listen_port: 9080
-        grpc_listen_port: 0
-      positions:
-        filename: /tmp/positions.yaml
-      clients:
-        - url: http://localhost:3100/loki/api/v1/push
-      scrape_configs:
-        - job_name: system
-          static_configs:
-            - targets:
-                - localhost
-              labels:
-                job: varlogs
-                __path__: /var/log/*.log
-
-    grafana_agent_config: |
-      server:
-        http_listen_port: 12345
-      metrics:
-        wal_directory: /tmp/wal
-        global:
-          scrape_interval: 15s
-          scrape_timeout: 10s
-        configs:
-          - name: integrations
-            scrape_configs:
-              - job_name: node_exporter
-                static_configs:
-                  - targets: ['host.docker.internal:9100']
+    docker_daemon_json: /etc/docker/daemon.json
 
   tasks:
 
-  - name: Ensure DNS is set via systemd-resolved
-    become: true
-    block:
-    - name: Configure systemd-resolved DNS
-      lineinfile:
-        path: /etc/systemd/resolved.conf
-        regexp: '^#?DNS='
-        line: 'DNS=1.1.1.1 8.8.8.8'
-        backup: yes
-
-    - name: Ensure DNSStubListener is enabled (optional)
-      lineinfile:
-        path: /etc/systemd/resolved.conf
-        regexp: '^#?DNSStubListener='
-        line: 'DNSStubListener=yes'
-        backup: yes
-
-    - name: Restart systemd-resolved
-      systemd:
-        name: systemd-resolved
-        state: restarted
-        enabled: true
-
-    - name: Recreate /etc/resolv.conf symlink (if broken or missing)
-      file:
-        src: /run/systemd/resolve/stub-resolv.conf
-        dest: /etc/resolv.conf
-        state: link
-        force: yes
-
-  - name: Install required packages for Docker repo setup
+  - name: Install required packages for RAID and Docker setup
     apt:
       name:
+      - mdadm
+      - apt-transport-https
       - ca-certificates
       - curl
       - gnupg
       - lsb-release
+      - software-properties-common
       state: present
       update_cache: yes
+
+  - name: Wait for apt lock to be released
+    shell: |
+      while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+        sleep 5
+      done
+    changed_when: false
+
+  - name: Fix broken dpkg installation
+    command: dpkg --configure -a
+    register: dpkg_fix
+    changed_when: dpkg_fix.rc == 0
+    failed_when: dpkg_fix.rc != 0 and dpkg_fix.rc != 1
+
+  - name: Add graphics drivers PPA (for NVIDIA drivers)
+    apt_repository:
+      repo: ppa:graphics-drivers/ppa
+      state: present
+      update_cache: yes
+
+  - name: Install NVIDIA driver (latest recommended)
+    apt:
+      name: nvidia-driver-525
+      state: present
+      update_cache: yes
+
+  - name: Create RAID 0 with /dev/sdb and /dev/sdc (if not exists)
+    command: mdadm --create --verbose /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
+    args:
+      creates: /dev/md0
+
+  - name: Wait for RAID device
+    wait_for:
+      path: /dev/md0
+      timeout: 30
+
+  - name: Format RAID volume (ext4)
+    filesystem:
+      fstype: ext4
+      dev: /dev/md0
+
+  - name: Create mount point /mnt/media
+    file:
+      path: /mnt/media
+      state: directory
+
+  - name: Mount RAID at /mnt/media
+    mount:
+      path: /mnt/media
+      src: /dev/md0
+      fstype: ext4
+      opts: defaults
+      state: mounted
+
+  - name: Get UUID of /dev/md0
+    command: blkid -s UUID -o value /dev/md0
+    register: md0_uuid
+
+  - name: Add RAID mount to fstab
+    lineinfile:
+      path: /etc/fstab
+      line: "UUID={{ md0_uuid.stdout }} /mnt/media ext4 defaults 0 0"
+      create: yes
+
+  - name: Save mdadm config (ignore errors)
+    shell: mdadm --detail --scan > /etc/mdadm/mdadm.conf
+    ignore_errors: yes
 
   - name: Create /etc/apt/keyrings directory
     file:
@@ -98,8 +107,14 @@
       repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
       state: present
       filename: docker
+    notify:
+    - Restart Docker
 
-  - name: Install Docker and Docker Compose plugin
+  - name: Update apt cache
+    apt:
+      update_cache: yes
+
+  - name: Install Docker and dependencies
     apt:
       name:
       - docker-ce
@@ -108,157 +123,316 @@
       - docker-buildx-plugin
       - docker-compose-plugin
       state: present
+
+  - name: Backup current cloud-init netplan file
+    copy:
+      src: /etc/netplan/50-cloud-init.yaml
+      dest: /etc/netplan/50-cloud-init.yaml.bak
+      remote_src: yes
+    ignore_errors: yes
+
+  - name: Configure static network via netplan
+    copy:
+      dest: /etc/netplan/01-netcfg.yaml
+      content: |
+        network:
+          version: 2
+          ethernets:
+            ens18:
+              addresses:
+                - 192.168.1.201/24
+              gateway4: 192.168.1.1
+              nameservers:
+                addresses: [8.8.8.8,8.8.4.4]
+
+  - name: Apply netplan config
+    command: netplan apply
+
+  - name: Pause for network to settle
+    pause:
+      seconds: 10
+
+  - name: Disable cloud-init networking
+    file:
+      path: /etc/cloud/cloud-init.disabled
+      state: touch
+
+  - name: Add NVIDIA Docker GPG key
+    apt_key:
+      url: https://nvidia.github.io/nvidia-docker/gpgkey
+      state: present
+
+  - name: Add NVIDIA Docker repository
+    shell: |
+      distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+      curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+    args:
+      creates: /etc/apt/sources.list.d/nvidia-docker.list
+
+  - name: Update apt cache after NVIDIA repo added
+    apt:
       update_cache: yes
 
-  - name: Ensure Docker is started and enabled
+  - name: Install nvidia-docker2 package
+    apt:
+      name: nvidia-docker2
+      state: present
+
+  - name: Configure Docker daemon for NVIDIA runtime
+    copy:
+      dest: "{{ docker_daemon_json }}"
+      content: |
+        {
+          "default-runtime": "nvidia",
+          "runtimes": {
+            "nvidia": {
+              "path": "nvidia-container-runtime",
+              "runtimeArgs": []
+            }
+          }
+        }
+    notify:
+    - Restart Docker
+
+  - name: Ensure Docker service started and enabled
     service:
       name: docker
       state: started
       enabled: yes
 
-  - name: Create service directory
+  - name: Create Docker compose directory
     file:
       path: "{{ docker_compose_dir }}"
       state: directory
       mode: '0755'
 
-  - name: Create fail2ban config directory
+  - name: Create media directories on RAID mount
     file:
-      path: "{{ docker_compose_dir }}/fail2ban"
+      path: "/mnt/media/{{ item }}"
       state: directory
-      mode: '0755'
+      mode: '0777'
+    loop:
+    - movies
+    - tv
+    - download
+    - radarr
+    - sonarr
+    - bazarr
+    - qbittorrent
 
-  - name: Write Promtail config
-    copy:
-      content: "{{ promtail_config }}"
-      dest: "{{ docker_compose_dir }}/promtail-config.yml"
-
-  - name: Write Grafana Agent config
-    copy:
-      content: "{{ grafana_agent_config }}"
-      dest: "{{ docker_compose_dir }}/grafana-agent-config.yaml"
-
-  - name: Remove wrongly created directory if exists
+  - name: Create SSD-based config directories
     file:
-      path: /opt/services/default.conf
-      state: absent
+      path: "/opt/{{ item }}"
+      state: directory
+      mode: '0777'
+    loop:
+    - overseerr
+    - plex
+    - jellyfin
+    - sonarr
+    - radarr
+    - bazarr
+    - qbittorrent
+    - prowlarr
 
-  - name: Create empty nginx default.conf file
-    copy:
-      dest: /opt/services/default.conf
-      content: ""
-      mode: '0644'
-
-  - name: Ensure default.conf exists for nginx
-    copy:
-      dest: /opt/services/default.conf
-      content: ""
-      force: no
-      mode: '0644'
-
-  - name: Write Docker Compose configuration
+  - name: Write Docker Compose file with Jellyfin GPU support
     copy:
       dest: "{{ docker_compose_file }}"
       content: |
         version: '3.8'
 
         services:
-          adguardhome:
-            image: adguard/adguardhome
-            container_name: adguardhome
-            ports:
-              - "3000:3000"
-              - "53:53/udp"
-              - "8081:80"
-            volumes:
-              - adguard_config:/opt/adguardhome/conf
-              - adguard_work:/opt/adguardhome/work
-            restart: unless-stopped
 
-          promtail:
-            image: grafana/promtail:latest
-            container_name: promtail
-            volumes:
-              - /var/log:/var/log
-              - "{{ docker_compose_dir }}/promtail-config.yml:/etc/promtail/config.yml"
-            command: -config.file=/etc/promtail/config.yml
-            restart: unless-stopped
-
-          grafana-agent:
-            image: grafana/agent:latest
-            container_name: grafana-agent
-            volumes:
-              - "{{ docker_compose_dir }}/grafana-agent-config.yaml:/etc/agent-config.yaml"
-            command: --config.file=/etc/agent-config.yaml
-            ports:
-              - "12345:12345"
-            restart: unless-stopped
-
-          watchtower:
-            image: containrrr/watchtower
-            container_name: watchtower
-            volumes:
-              - /var/run/docker.sock:/var/run/docker.sock
-            command: --cleanup --interval 3600
-            restart: unless-stopped
-
-          nginx:
-            image: nginx:latest
-            container_name: nginx
-            ports:
-              - "80:80"
-            volumes:
-              - /opt/services/default.conf:/etc/nginx/conf.d/default.conf:rw
-            restart: unless-stopped
-
-          fail2ban:
-            image: crazymax/fail2ban
-            container_name: fail2ban
+          plex:
+            image: plexinc/pms-docker:latest
+            container_name: plex
             network_mode: host
+            environment:
+              - TZ=Europe/London
             volumes:
-              - /var/log:/var/log:ro
-              - "{{ docker_compose_dir }}/fail2ban:/data"
-            restart: unless-stopped
-
-          portainer:
-            image: portainer/portainer-ce:latest
-            container_name: portainer
+              - /opt/plex:/config
+              - /mnt/media:/data
             ports:
-              - "9000:9000"
-            volumes:
-              - /var/run/docker.sock:/var/run/docker.sock
-              - portainer_data:/data
+              - "32400:32400/tcp"
+              - "1900:1900/udp"
+              - "32410:32410/udp"
+              - "32412:32412/udp"
+              - "32413:32413/udp"
+              - "32414:32414/udp"
+              - "5353:5353/udp"
             restart: unless-stopped
 
-          uptime-kuma:
-            image: louislam/uptime-kuma:latest
-            container_name: uptime-kuma
+          jellyfin:
+            image: jellyfin/jellyfin:latest
+            container_name: jellyfin
             ports:
-              - "3001:3001"
+              - "8096:8096"
+              - "8920:8920"
+            environment:
+              - TZ=Europe/London
+              - NVIDIA_VISIBLE_DEVICES=all
+            deploy:
+              resources:
+                reservations:
+                  devices:
+                    - driver: nvidia
+                      capabilities: [gpu]
             volumes:
-              - uptime_kuma_data:/app/data
+              - /opt/jellyfin:/config
+              - /mnt/media:/media
             restart: unless-stopped
 
-        volumes:
-          adguard_config:
-          adguard_work:
-          portainer_data:
-          uptime_kuma_data:
+          overseerr:
+            image: sctx/overseerr:latest
+            container_name: overseerr
+            ports:
+              - "5055:5055"
+            environment:
+              - TZ=Europe/London
+            volumes:
+              - /opt/overseerr:/app/config
+            restart: unless-stopped
 
-  - name: Pull Docker images
-    command: docker compose pull
+          radarr:
+            image: linuxserver/radarr
+            container_name: radarr
+            ports:
+              - "7878:7878"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/radarr:/config
+              - /mnt/media/movies:/movies
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          sonarr:
+            image: linuxserver/sonarr
+            container_name: sonarr
+            ports:
+              - "8989:8989"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/sonarr:/config
+              - /mnt/media/tv:/tv
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          bazarr:
+            image: linuxserver/bazarr
+            container_name: bazarr
+            ports:
+              - "6767:6767"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/bazarr:/config
+              - /mnt/media/tv:/tv
+              - /mnt/media/movies:/movies
+            restart: unless-stopped
+
+          qbittorrent:
+            image: linuxserver/qbittorrent
+            container_name: qbittorrent
+            ports:
+              - "8080:8080"
+              - "6881:6881"
+              - "6881:6881/udp"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+              - WEBUI_PORT=8080
+            volumes:
+              - /opt/qbittorrent:/config
+              - /mnt/media/download:/downloads
+            restart: unless-stopped
+
+          prowlarr:
+            image: linuxserver/prowlarr
+            container_name: prowlarr
+            ports:
+              - "9696:9696"
+            environment:
+              - PUID=1000
+              - PGID=1000
+              - TZ=Europe/London
+            volumes:
+              - /opt/prowlarr:/config
+            restart: unless-stopped
+
+  - name: Remove existing Jellyfin container if any
+    shell: docker rm -f jellyfin
+    ignore_errors: yes
+
+  - name: Pull latest Docker images
+    shell: docker compose pull
     args:
       chdir: "{{ docker_compose_dir }}"
 
-  - name: Start Docker containers
-    command: docker compose up -d
+  - name: Deploy Docker services
+    shell: docker compose up -d
     args:
       chdir: "{{ docker_compose_dir }}"
 
-  - name: Show running containers
-    shell: docker ps --format '{{"{{.Names}}"}} - {{"{{.Status}}"}}'
-    register: running_containers
+  - name: Check NVIDIA GPUs present
+    shell: nvidia-smi --list-gpus
+    register: nvidia_gpu_check
+    ignore_errors: yes
 
-  - name: Output container status
-    debug:
-      var: running_containers.stdout_lines
+  - name: Restart Jellyfin container with GPU support if NVIDIA GPUs detected
+    when: nvidia_gpu_check.rc == 0 and nvidia_gpu_check.stdout != ""
+    block:
+    - name: Stop Jellyfin container
+      shell: docker stop jellyfin
+      ignore_errors: yes
+
+    - name: Remove Jellyfin container
+      shell: docker rm jellyfin
+      ignore_errors: yes
+
+    - name: Start Jellyfin with NVIDIA runtime
+      shell: >
+        docker run -d --gpus all --name jellyfin -p 8096:8096 -p 8920:8920 -v /opt/jellyfin:/config -v /mnt/media:/media jellyfin/jellyfin:latest
+      when: nvidia_gpu_check.rc == 0 and nvidia_gpu_check.stdout != ""
+
+  - name: Enable and configure UFW firewall
+    block:
+    - name: Allow necessary ports
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+      - 32400 # Plex
+      - 8096 # Jellyfin
+      - 8920 # Jellyfin SSL
+      - 5055 # Overseerr
+      - 7878 # Radarr
+      - 8989 # Sonarr
+      - 6767 # Bazarr
+      - 8080 # qBittorrent webui
+      - 9696 # Prowlarr
+
+    - name: Enable UFW if not enabled
+      shell: ufw status | grep -qw active
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Enable UFW firewall
+      command: ufw --force enable
+      when: ufw_status.rc != 0
+
+  handlers:
+  - name: Restart Docker
+    service:
+      name: docker
+      state: restarted
